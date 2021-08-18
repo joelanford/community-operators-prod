@@ -1,0 +1,4 @@
+indexImageRepo: quay.io/openshift-community-operators
+defaultMode: semver-mode
+bundleImageTemplate: quay.io/openshift-community-operators/{{.PackageName}}:v{{.Version}}
+openshiftVersions: ["4.6", "4.7", "4.8", "4.9"]

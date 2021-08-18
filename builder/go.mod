@@ -8,7 +8,9 @@ require (
 	github.com/bshuster-repo/logrus-logstash-hook v1.0.2 // indirect
 	github.com/operator-framework/operator-registry v0.0.0
 	github.com/sirupsen/logrus v1.8.1
+	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9
 	k8s.io/apimachinery v0.20.6
+	k8s.io/client-go v0.20.6
 	rsc.io/letsencrypt v0.0.3 // indirect
 	sigs.k8s.io/yaml v1.2.0
 )
