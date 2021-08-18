@@ -6,6 +6,7 @@ require (
 	github.com/Shopify/logrus-bugsnag v0.0.0-20171204204709-577dee27f20d // indirect
 	github.com/blang/semver/v4 v4.0.0
 	github.com/bshuster-repo/logrus-logstash-hook v1.0.2 // indirect
+	github.com/operator-framework/api v0.7.1
 	github.com/operator-framework/operator-registry v0.0.0
 	github.com/sirupsen/logrus v1.8.1
 	k8s.io/apimachinery v0.20.6

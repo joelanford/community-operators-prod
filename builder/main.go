@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,27 +16,29 @@ import (
 	"strings"
 
 	"github.com/blang/semver/v4"
-	"github.com/operator-framework/operator-registry/alpha/action"
+	"github.com/operator-framework/api/pkg/manifests"
 	"github.com/operator-framework/operator-registry/alpha/declcfg"
 	"github.com/operator-framework/operator-registry/alpha/property"
 	"github.com/operator-framework/operator-registry/pkg/image"
 	"github.com/operator-framework/operator-registry/pkg/registry"
-	"github.com/operator-framework/operator-registry/pkg/sqlite"
-	log "github.com/sirupsen/logrus"
+	"github.com/redhat-openshift-ecosystem/community-operators-prod/builder/pkg"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/yaml"
 )
 
 func main() {
+	log := logrus.New()
+	logrus.SetOutput(ioutil.Discard)
 	if len(os.Args) != 4 {
 		log.Fatalf("Usage: %s <rootDir> <dcDir> <ocpVersion>", os.Args[0])
 	}
-	if err := run(context.Background(), os.Args[1], os.Args[2], os.Args[3]); err != nil {
+	if err := run(context.Background(), log, os.Args[1], os.Args[2], os.Args[3]); err != nil {
 		log.Fatal(err)
 	}
 }
 
-func run(ctx context.Context, inDir, outDir, targetOCPVersion string) error {
+func run(ctx context.Context, log *logrus.Logger, inDir, outDir, targetOCPVersion string) error {
 	if _, err := os.Stat(outDir); err == nil {
 		return fmt.Errorf("output directory %q already exists", outDir)
 	}
@@ -44,7 +47,7 @@ func run(ctx context.Context, inDir, outDir, targetOCPVersion string) error {
 		return err
 	}
 
-	nullLogger := log.New()
+	nullLogger := logrus.New()
 	nullLogger.Out = ioutil.Discard
 	for _, p := range packages {
 		if !p.IsDir() {
@@ -62,12 +65,18 @@ func run(ctx context.Context, inDir, outDir, targetOCPVersion string) error {
 
 		var cfg *declcfg.DeclarativeConfig
 		if isPackageManifests(pkgDirContents) {
-			cfg, err = renderPackageManifests(ctx, pkgDir)
+			log.Infof("rendering package manifest %q", pkgDir)
+			cfg, err = renderPackageManifests(log, pkgDir)
 		} else {
-			cfg, err = renderBundles(ctx, pkgDir, pkgDirContents, targetOCPVersion)
+			log.Infof("rendering bundles in %q", pkgDir)
+			cfg, err = renderBundles(log, pkgDir, pkgDirContents, targetOCPVersion)
 		}
 		if err != nil {
 			log.Errorf("failed to render DC for package %q: %v", p.Name(), err)
+			continue
+		}
+		if cfg == nil {
+			log.Warnf("package %q has no bundles in version %q", p.Name(), targetOCPVersion)
 			continue
 		}
 
@@ -138,7 +147,7 @@ func run(ctx context.Context, inDir, outDir, targetOCPVersion string) error {
 	return nil
 }
 
-func renderBundles(ctx context.Context, pkgDir string, pkgDirContents []os.DirEntry, targetOCPVersion string) (*declcfg.DeclarativeConfig, error) {
+func renderBundles(log *logrus.Logger, pkgDir string, pkgDirContents []os.DirEntry, targetOCPVersion string) (*declcfg.DeclarativeConfig, error) {
 	packageName := filepath.Base(pkgDir)
 	rbundles := []registry.Bundle{}
 	versions := map[string]semver.Version{}
@@ -184,6 +193,9 @@ func renderBundles(ctx context.Context, pkgDir string, pkgDirContents []os.DirEn
 
 		rbundles = append(rbundles, *ii.Bundle)
 	}
+	if len(rbundles) == 0 {
+		return nil, nil
+	}
 
 	cfg := &declcfg.DeclarativeConfig{}
 
@@ -192,7 +204,7 @@ func renderBundles(ctx context.Context, pkgDir string, pkgDirContents []os.DirEn
 		if err != nil {
 			return nil, err
 		}
-		cfg.Bundles = append(cfg.Bundles, dcb.Bundles...)
+		cfg.Bundles = append(cfg.Bundles, *dcb)
 	}
 	for _, b := range cfg.Bundles {
 		props, err := property.Parse(b.Properties)
@@ -246,40 +258,60 @@ func renderBundles(ctx context.Context, pkgDir string, pkgDirContents []os.DirEn
 	return cfg, nil
 }
 
-func renderPackageManifests(ctx context.Context, ref string) (*declcfg.DeclarativeConfig, error) {
-	tmpDB, err := os.CreateTemp("", "opm-render-pm-")
+func renderPackageManifests(log *logrus.Logger, ref string) (*declcfg.DeclarativeConfig, error) {
+	pm, defChHead, bundleMap, err := pkg.LoadPackageManifest(ref)
 	if err != nil {
 		return nil, err
 	}
-	if err := tmpDB.Close(); err != nil {
-		return nil, err
+
+	var icon *declcfg.Icon
+	if len(defChHead.CSV.Spec.Icon) > 0 {
+		iconData, err := base64.StdEncoding.DecodeString(defChHead.CSV.Spec.Icon[0].Data)
+		if err != nil {
+			log.Warnf("ignoring icon data: failed to decode: %v", err)
+		} else {
+			icon = &declcfg.Icon{
+				Data:      iconData,
+				MediaType: defChHead.CSV.Spec.Icon[0].MediaType,
+			}
+		}
+	}
+	description := defChHead.CSV.Spec.Description
+
+	cfg := &declcfg.DeclarativeConfig{
+		Packages: []declcfg.Package{
+			{
+				Schema:         "olm.package",
+				Name:           pm.PackageName,
+				DefaultChannel: pm.DefaultChannelName,
+				Icon:           icon,
+				Description:    description,
+			},
+		},
 	}
 
-	db, err := sqlite.Open(tmpDB.Name())
-	if err != nil {
-		return nil, err
+	bundles := make([]manifests.Bundle, 0, len(bundleMap))
+	for _, b := range bundleMap {
+		bundles = append(bundles, b)
 	}
-	defer db.Close()
-	defer os.RemoveAll(tmpDB.Name())
+	pkg.SortBundles(bundles)
 
-	dbLoader, err := sqlite.NewSQLLiteLoader(db)
-	if err != nil {
-		return nil, err
-	}
-	if err := dbLoader.Migrate(context.TODO()); err != nil {
-		return nil, err
+	for _, b := range bundles {
+		annots := registry.Annotations{
+			PackageName:        pm.PackageName,
+			Channels:           strings.Join(b.Channels, ","),
+			DefaultChannelName: pm.DefaultChannelName,
+		}
+		rbundle := registry.NewBundle(b.Name, &annots, b.Objects...)
+		dcBundle, err := bundleToDeclcfg(rbundle)
+		if err != nil {
+			return nil, err
+		}
+		dcBundle.Image = fmt.Sprintf("quay.io/openshift-community-operators/%s:v%s", pm.PackageName, b.CSV.Spec.Version.String())
+		cfg.Bundles = append(cfg.Bundles, *dcBundle)
 	}
 
-	loader := sqlite.NewSQLLoaderForDirectory(dbLoader, ref)
-	if err := loader.Populate(); err != nil {
-		return nil, fmt.Errorf("error loading manifests from directory: %s", err)
-	}
-
-	a := action.Render{
-		Refs:           []string{tmpDB.Name()},
-		AllowedRefMask: action.RefSqliteFile,
-	}
-	return a.Run(ctx)
+	return cfg, nil
 }
 
 func isPackageManifests(entries []os.DirEntry) bool {
@@ -291,7 +323,7 @@ func isPackageManifests(entries []os.DirEntry) bool {
 	return false
 }
 
-func bundleToDeclcfg(bundle *registry.Bundle) (*declcfg.DeclarativeConfig, error) {
+func bundleToDeclcfg(bundle *registry.Bundle) (*declcfg.Bundle, error) {
 	bundleProperties, err := registry.PropertiesFromBundle(bundle)
 	if err != nil {
 		return nil, fmt.Errorf("get properties for bundle %q: %v", bundle.Name, err)
@@ -301,16 +333,14 @@ func bundleToDeclcfg(bundle *registry.Bundle) (*declcfg.DeclarativeConfig, error
 		return nil, fmt.Errorf("get related images for bundle %q: %v", bundle.Name, err)
 	}
 
-	dBundle := declcfg.Bundle{
+	return &declcfg.Bundle{
 		Schema:        "olm.bundle",
 		Name:          bundle.Name,
 		Package:       bundle.Package,
 		Image:         bundle.BundleImage,
 		Properties:    bundleProperties,
 		RelatedImages: relatedImages,
-	}
-
-	return &declcfg.DeclarativeConfig{Bundles: []declcfg.Bundle{dBundle}}, nil
+	}, nil
 }
 
 func getRelatedImages(b *registry.Bundle) ([]declcfg.RelatedImage, error) {
@@ -380,7 +410,10 @@ func rangeContainsVersion(r string, v string) (bool, error) {
 		if strings.HasPrefix(min, "=") || strings.HasPrefix(max, "=") {
 			return false, fmt.Errorf("invalid range %q: cannot use equal prefix with range", r)
 		}
-		semverRangeStr := fmt.Sprintf(">=%s.0 <=%s.0", min, max)
+
+		trimmedMin := strings.TrimPrefix(min, "v")
+		trimmedMax := strings.TrimPrefix(max, "v")
+		semverRangeStr := fmt.Sprintf(">=%s.0 <=%s.0", trimmedMin, trimmedMax)
 		semverRange, err = semver.ParseRange(semverRangeStr)
 		if err != nil {
 			return false, fmt.Errorf("invalid range %q: %v", r, err)
